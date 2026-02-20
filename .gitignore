@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Icon?
+Thumbs.db
+
+# Dataset (11GB – download separately via download_groove_midi.sh)
+groove_midi/
+
+# Model checkpoints & outputs
+outputs/*.pt
+
+# Jupyter
+.ipynb_checkpoints/
