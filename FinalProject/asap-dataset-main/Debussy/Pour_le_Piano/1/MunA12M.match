@@ -1,0 +1,8 @@
+info(matchFileVersion,1.0.0).
+info(piece,-).
+info(scoreFileName,-).
+info(midiFileName,-).
+info(composer,-).
+info(performer,-).
+info(midiClockUnits,480).
+info(midiClockRate,500000).
