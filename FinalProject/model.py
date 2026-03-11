@@ -1,5 +1,5 @@
 """
-BiLSTM models for rhythm quantization.
+BiLSTM and Transformer models for rhythm quantization.
 
 Given per-note performance features (IOI, duration, velocity, pitch encoding),
 predicts rhythm labels:
@@ -7,11 +7,13 @@ predicts rhythm labels:
     • subdivision index   (0-4)
     • duration class      (0-7, from DURATION_VOCAB)
 
-Two model variants:
-  1. RhythmQuantizer       — single composite head (160 classes)
-  2. MultiHeadRhythmQuantizer — three separate heads (4 + 5 + 8 classes)
+Three model variants:
+  1. RhythmQuantizer              — single composite head (160 classes)
+  2. MultiHeadRhythmQuantizer     — three separate heads, BiLSTM encoder
+  3. TransformerRhythmQuantizer   — three separate heads, Transformer encoder
 """
 
+import math
 import torch
 import torch.nn as nn
 
@@ -63,7 +65,7 @@ def composite_to_targets(composite: torch.Tensor) -> torch.Tensor:
 
 
 # ------------------------------------------------------------------
-# Model
+# Model 1: Single-head BiLSTM
 # ------------------------------------------------------------------
 class RhythmQuantizer(nn.Module):
     """
@@ -100,16 +102,6 @@ class RhythmQuantizer(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x : (B, T, input_dim)  padded input sequences
-        lengths : (B,) optional true lengths for packing
-
-        Returns
-        -------
-        logits : (B, T, num_classes)
-        """
         x = self.input_norm(x)
 
         if lengths is not None:
@@ -121,20 +113,17 @@ class RhythmQuantizer(nn.Module):
         else:
             h, _ = self.lstm(x)
 
-        logits = self.head(h)  # (B, T, C)
+        logits = self.head(h)
         return logits
 
 
 # ------------------------------------------------------------------
-# Multi-head Model
+# Model 2: Multi-head BiLSTM
 # ------------------------------------------------------------------
 class MultiHeadRhythmQuantizer(nn.Module):
     """
     BiLSTM encoder → three independent classification heads for
     beat (4), subdivision (5), and duration (8).
-
-    This reduces the output space from 160 composite classes to
-    4 + 5 + 8 = 17 independent classes, making learning much easier.
     """
 
     def __init__(
@@ -157,22 +146,19 @@ class MultiHeadRhythmQuantizer(nn.Module):
             dropout=dropout if num_layers > 1 else 0.0,
         )
 
-        enc_dim = hidden_dim * 2  # bidirectional
+        enc_dim = hidden_dim * 2
 
-        # Shared projection from LSTM output
         self.shared = nn.Sequential(
             nn.Linear(enc_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
         )
 
-        # Independent heads
         self.beat_head = nn.Linear(hidden_dim, NUM_BEATS)
         self.subdiv_head = nn.Linear(hidden_dim, NUM_SUBDIVS)
         self.dur_head = nn.Linear(hidden_dim, NUM_DUR_CLASSES)
 
     def _encode(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
-        """Run LSTM encoder and shared projection. Returns (B, T, hidden_dim)."""
         x = self.input_norm(x)
 
         if lengths is not None:
@@ -189,19 +175,125 @@ class MultiHeadRhythmQuantizer(nn.Module):
     def forward(
         self, x: torch.Tensor, lengths: torch.Tensor | None = None
     ) -> dict[str, torch.Tensor]:
+        h = self._encode(x, lengths)
+        return {
+            "beat": self.beat_head(h),
+            "subdiv": self.subdiv_head(h),
+            "dur": self.dur_head(h),
+        }
+
+
+# ------------------------------------------------------------------
+# Model 3: Transformer Multi-head
+# ------------------------------------------------------------------
+class PositionalEncoding(nn.Module):
+    """Standard sinusoidal positional encoding."""
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 2048):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.pe[:, : x.shape[1]]
+        return self.dropout(x)
+
+
+class TransformerRhythmQuantizer(nn.Module):
+    """
+    Transformer encoder → three independent classification heads for
+    beat (4), subdivision (5), and duration (8).
+
+    Unlike the BiLSTM, the Transformer attends over the full sequence,
+    which helps capture long-range metrical dependencies.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 7,
+        hidden_dim: int = 128,
+        num_layers: int = 4,
+        nhead: int = 4,
+        dropout: float = 0.1,
+        dim_feedforward: int = 512,
+    ):
+        super().__init__()
+
+        self.input_norm = nn.LayerNorm(input_dim)
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.pos_enc = PositionalEncoding(hidden_dim, dropout=dropout)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,  # Pre-LN for stable training
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+            norm=nn.LayerNorm(hidden_dim),
+        )
+
+        self.beat_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, NUM_BEATS),
+        )
+        self.subdiv_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, NUM_SUBDIVS),
+        )
+        self.dur_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, NUM_DUR_CLASSES),
+        )
+
+    def forward(
+        self, x: torch.Tensor, lengths: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor]:
         """
         Parameters
         ----------
         x       : (B, T, input_dim)
-        lengths : (B,) optional true lengths for packing
+        lengths : (B,) optional true lengths for padding mask
 
         Returns
         -------
         dict with keys 'beat', 'subdiv', 'dur', each (B, T, num_classes_i)
         """
-        h = self._encode(x, lengths)
+        x = self.input_norm(x)
+        x = self.input_proj(x)
+        x = self.pos_enc(x)
+
+        src_key_padding_mask = None
+        if lengths is not None:
+            B, T, _ = x.shape
+            src_key_padding_mask = (
+                torch.arange(T, device=x.device).unsqueeze(0)
+                >= lengths.unsqueeze(1).to(x.device)
+            )
+
+        h = self.transformer(x, src_key_padding_mask=src_key_padding_mask)
+
         return {
-            "beat": self.beat_head(h),      # (B, T, 4)
-            "subdiv": self.subdiv_head(h),  # (B, T, 5)
-            "dur": self.dur_head(h),        # (B, T, 8)
+            "beat": self.beat_head(h),
+            "subdiv": self.subdiv_head(h),
+            "dur": self.dur_head(h),
         }
