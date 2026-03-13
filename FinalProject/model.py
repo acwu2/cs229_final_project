@@ -19,8 +19,8 @@ import torch.nn as nn
 
 # ----- label-space constants -----
 NUM_BEATS = 4          # beat_index_in_bar: 0-3
-NUM_SUBDIVS = 5        # subdivision_index: 0-4  (round can produce 4)
-NUM_DUR_CLASSES = 8    # |DURATION_VOCAB|
+NUM_SUBDIVS = 13        # subdivision_index: 0-12
+NUM_DUR_CLASSES = 12    # |DURATION_VOCAB|
 NUM_COMPOSITE = NUM_BEATS * NUM_SUBDIVS * NUM_DUR_CLASSES  # 160
 
 

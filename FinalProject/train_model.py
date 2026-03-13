@@ -69,7 +69,7 @@ def collate_fn(batch):
 
     B = len(xs)
     x_pad = torch.zeros(B, max_len, xs[0].shape[-1])
-    y_pad = torch.full((B, max_len), -100, dtype=torch.long)  # -100 = ignore in CE
+    y_pad = torch.full((B, max_len), -100, dtype=torch.long)  # -100 = ignore in CE, works with pytorch default setting
 
     for i, (x, y) in enumerate(zip(xs, ys)):
         T = x.shape[0]

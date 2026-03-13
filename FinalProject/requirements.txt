@@ -3,3 +3,6 @@ python-rtmidi
 pandas
 partitura
 torch
+tqdm
+tensorboard
+sklearn

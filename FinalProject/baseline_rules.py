@@ -39,7 +39,7 @@ from parse_asap_data import DURATION_CLASSES, DURATION_VOCAB, IDX_TO_DURATION
 # ------------------------------------------------------------------
 # Core rules
 # ------------------------------------------------------------------
-SUBDIVISIONS = 4          # quarter-beat grid (same as beat_to_bar_position)
+SUBDIVISIONS = 12          # quarter-beat grid (same as beat_to_bar_position)
 SORTED_DUR_KEYS = sorted(DURATION_CLASSES.keys())   # [0.25, 0.5, …, 4.0]
 
 

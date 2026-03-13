@@ -28,21 +28,17 @@ def load_annotations(json_path):
 
 # -----------------------------
 # Utility: build time→beat mapping
+# the mapping returns time since first note, normalized by median bpm
 # -----------------------------
-def build_time_to_beat_fn(beat_times):
+def build_time_to_beat_fn(beat_times, first_note_time, first_note_beat):
     beat_times = np.array(beat_times)
-    beat_indices = np.arange(len(beat_times))
+
+    beat_intervals = np.diff(beat_times)
+    bpm = 60.0 / np.median(beat_intervals)
+    t0 = first_note_time
 
     def f(t):
-        if t <= beat_times[0]:
-            return 0.0
-        if t >= beat_times[-1]:
-            return float(len(beat_times) - 1)
-
-        i = np.searchsorted(beat_times, t) - 1
-        t0, t1 = beat_times[i], beat_times[i + 1]
-        b0, b1 = beat_indices[i], beat_indices[i + 1]
-        return b0 + (t - t0) / (t1 - t0)
+        return (t - t0) * bpm / 60.0 + first_note_beat
 
     return f
 
@@ -62,62 +58,167 @@ def encode_pitch(pitch):
 
 # -----------------------------
 # Duration classification
+#
+# Covers standard 16th-note grid values plus 8th-note triplet values.
+# A "null" token handles any duration that doesn't snap within tolerance.
+#
+# 8th-note triplet durations (in quarter-note beats, where one triplet
+# 8th = 1/3 beat):
+#   triplet_8th        = 1/3  ≈ 0.333
+#   triplet_quarter    = 2/3  ≈ 0.667  (two triplet 8ths tied)
+#   triplet_half       = 4/3  ≈ 1.333  (four triplet 8ths tied)
 # -----------------------------
 DURATION_CLASSES = {
-    0.25: "16th",
-    0.5: "8th",
-    0.75: "dotted_8th",
-    1.0: "quarter",
-    1.5: "dotted_quarter",
-    2.0: "half",
-    3.0: "dotted_half",
-    4.0: "whole"
+    # Standard 16th-note grid
+    0.25:          "16th",
+    0.5:           "8th",
+    0.75:          "dotted_8th",
+    1.0:           "quarter",
+    1.5:           "dotted_quarter",
+    2.0:           "half",
+    3.0:           "dotted_half",
+    4.0:           "whole",
+    # 8th-note triplet grid
+    1.0 / 3.0:     "triplet_8th",
+    2.0 / 3.0:     "triplet_quarter",
+    4.0 / 3.0:     "triplet_half",
 }
 
-# Build duration label → index mapping
-DURATION_LABELS = sorted(set(DURATION_CLASSES.values()))
-DURATION_VOCAB = {label: idx for idx, label in enumerate(DURATION_LABELS)}
+# Snap tolerance: a duration must be within this many beats of a class value
+# to be assigned that class; otherwise it gets the null token.
+DURATION_SNAP_TOL = 0.08   # ~5% of a quarter note
 
-# Optional reverse mapping (useful later for decoding predictions)
+NULL_DURATION = "null"
+
+# Build duration label → index mapping (null token gets the last index)
+DURATION_LABELS = sorted(set(DURATION_CLASSES.values())) + [NULL_DURATION]
+DURATION_VOCAB  = {label: idx for idx, label in enumerate(DURATION_LABELS)}
+
+# Reverse mapping
 IDX_TO_DURATION = {idx: label for label, idx in DURATION_VOCAB.items()}
 
+NULL_DURATION_IDX = DURATION_VOCAB[NULL_DURATION]
+
+
 def quantize_duration(d):
-    closest = min(DURATION_CLASSES.keys(), key=lambda x: abs(x - d))
-    return DURATION_CLASSES[closest]
+    """
+    Snap d (in quarter-note beats) to the nearest entry in DURATION_CLASSES.
+    Returns the label string, or NULL_DURATION if nothing is close enough.
+    """
+    closest_val   = min(DURATION_CLASSES.keys(), key=lambda x: abs(x - d))
+    if abs(closest_val - d) <= DURATION_SNAP_TOL:
+        return DURATION_CLASSES[closest_val]
+    return NULL_DURATION
 
 
 # -----------------------------
-# Subdivision helper
+# Subdivision grid
+#
+# We use 12 subdivisions per beat — the least common multiple of 4 (16th
+# grid) and 3 (triplet grid).  This lets both grids snap to exact integer
+# positions:
+#   16th positions:            0, 3, 6, 9      (step = 12/4 = 3)
+#   8th-triplet positions:     0, 4, 8         (step = 12/3 = 4)
+#
+# A note that doesn't snap within tolerance gets subdivision index NULL_SUBDIV.
 # -----------------------------
-def beat_to_bar_position(beat_float, beats_per_bar=4, subdivs=4):
+SUBDIVS_PER_BEAT = 12
+SUBDIV_SNAP_TOL  = 0.5   # in 12ths-of-a-beat units (half a grid step)
+
+NULL_SUBDIV = SUBDIVS_PER_BEAT   # index 12 → "doesn't fit either grid"
+NUM_SUBDIV_CLASSES = SUBDIVS_PER_BEAT + 1   # 0-11 valid + 12 null
+
+
+def beat_to_bar_position(beat_float, beats_per_bar=4):
+    """
+    Returns (beat_index_in_bar, subdivision_index) where subdivision is
+    quantised to a 12-subdivision-per-beat grid covering both 16th-note and
+    8th-note-triplet positions.  Out-of-grid onsets get subdivision=NULL_SUBDIV.
+    """
     beat_index = int(beat_float) % beats_per_bar
-    frac = beat_float - int(beat_float)
-    subdivision = int(round(frac * subdivs))
-    return beat_index, subdivision
+    frac       = beat_float - int(beat_float)          # 0.0 – <1.0
+
+    # position on the 12-step grid (real-valued)
+    grid_pos      = frac * SUBDIVS_PER_BEAT
+    nearest_step  = round(grid_pos)
+
+    if abs(grid_pos - nearest_step) <= SUBDIV_SNAP_TOL:
+        subdiv = int(nearest_step) % SUBDIVS_PER_BEAT  # wrap 12 → 0
+    else:
+        subdiv = NULL_SUBDIV
+
+    return beat_index, subdiv
 
 
 # -----------------------------
-# Core parser for one performance
+# Build list of 4/4 time ranges from the perf_time_signatures dict.
+#
+# perf_time_signatures is keyed by annotation time in seconds (as a string)
+# → [ts_string, beats_per_bar].  Each entry marks the start of a new time
+# signature; it applies until the next entry (or end of piece).
+# Returns a list of (start_sec, end_sec_or_None) covering only 4/4 spans.
 # -----------------------------
-def parse_performance(piece_root, perf_mid, xml_score, alignment_file, beat_map):
+def get_44_time_ranges(time_sigs):
+    """
+    Returns a list of (start_sec, end_sec_or_None) for every 4/4 section.
+    end_sec=None means open-ended (until the last note of the performance).
+    """
+    sorted_changes = sorted(
+        ((float(t_str), ts_str) for t_str, (ts_str, _) in time_sigs.items()),
+        key=lambda x: x[0]
+    )
 
-    # Load performance + score
+    ranges_44 = []
+    for i, (start_sec, ts_str) in enumerate(sorted_changes):
+        if ts_str != "4/4":
+            continue
+        end_sec = sorted_changes[i + 1][0] if i + 1 < len(sorted_changes) else None
+        ranges_44.append((start_sec, end_sec))
+
+    return ranges_44
+
+
+# -----------------------------
+# Core parser for one performance.
+# Accepts a list of (start_sec, end_sec) time ranges to restrict extraction.
+# Returns one (inputs, targets) pair per contiguous 4/4 section.
+# -----------------------------
+def parse_performance(piece_root, perf_mid, score, alignment_file, annotations,
+                      time_ranges_44=None):
+    """
+    Parameters
+    ----------
+    time_ranges_44 : list of (start_sec, end_sec_or_None) or None
+        Performance-time intervals (seconds) to include.
+        end_sec=None means until the last note of the performance.
+        If None, all notes are included (original behaviour).
+
+    Returns
+    -------
+    sections : list of (inputs, targets)
+        One entry per contiguous 4/4 section.  Each inputs/targets is a
+        list of dicts as before.  If time_ranges_44 is None the list has
+        one entry covering the whole performance.
+
+    Notes
+    -----
+    Notes whose score duration doesn't snap to any known duration class are
+    included with duration_class=NULL_DURATION (model should mask/ignore them
+    for the duration head but they still contribute sequence context).
+    Similarly, onsets that don't snap to the 12-step subdivision grid receive
+    subdivision_index=NULL_SUBDIV.
+    """
+
+    # Load performance
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        
         performance = partitura.load_performance_midi(perf_mid)
-        score = partitura.load_musicxml(xml_score)
 
-    # Build time->beat converter
-    # print(beat_map.keys())
-    
+    # Find beat map entry for this performance
     key = str(perf_mid).split("asap-dataset-main")[-1].lstrip("/")
-    if key not in beat_map:
+    if key not in annotations:
         print(f"    WARNING: No beat map found for {key}, skipping performance")
-        return [], []
-
-    beat_times = beat_map[key]["performance_beats"]
-    t2b = build_time_to_beat_fn(beat_times)
+        return []
 
     # Load alignment TSV
     align = {}
@@ -126,98 +227,130 @@ def parse_performance(piece_root, perf_mid, xml_score, alignment_file, beat_map)
         for line in f:
             if len(line.strip().split("\t")) < 3:
                 continue
-            xml_id, midi_id, *_ , onset = line.strip().split("\t")
+            xml_id, midi_id, *_, onset = line.strip().split("\t")
             base_xml_id = xml_id.split("-")[0]   # removes -1, -2, etc.
             align[str(midi_id)] = base_xml_id
 
     # Build score lookup
-    score_na = score.note_array()
+    score_na    = score.note_array()
     score_notes = {n["id"]: n for n in score_na}
 
-    inputs = []
-    targets = []
-
-    # Extract performance notes
     notes = performance.note_array()
 
-    prev_velocity = None
-    prev_onset_beat = None
+    # Resolve open-ended ranges using the last note's onset time
+    max_onset_sec = max(float(n["onset_sec"]) for n in notes) + 1.0
+    if time_ranges_44 is None:
+        resolved_ranges = [(0.0, max_onset_sec)]
+    else:
+        resolved_ranges = [
+            (s, max_onset_sec if e is None else e)
+            for s, e in time_ranges_44
+        ]
+
+    # One result bucket per range; each tracks its own prev state
+    sections = {
+        i: {
+            "inputs": [],
+            "targets": [],
+            "prev_velocity": None,
+            "prev_onset_beat": None,
+            "first_valid_note": False,
+            "get_beats": None,
+        }
+        for i in range(len(resolved_ranges))
+    }
 
     for n in notes:
-
-        onset_sec = n["onset_sec"]
-        duration_sec = n["duration_sec"]
-        offset_sec = onset_sec + duration_sec
-        pitch = n["pitch"]
-        velocity = n["velocity"] / 127.0
         midi_id = n["id"]
-
         if midi_id not in align:
             continue
         xml_id = align[midi_id]
         if xml_id not in score_notes:
             continue
 
-        score_note = score_notes[xml_id]
+        onset_sec = float(n["onset_sec"])
 
-        onset_beat = t2b(onset_sec)
-        offset_beat = t2b(offset_sec)
+        # Determine which section this note belongs to (at most one)
+        sec_idx = None
+        for i, (sec_start, sec_end) in enumerate(resolved_ranges):
+            if sec_start <= onset_sec < sec_end:
+                sec_idx = i
+                break
+        if sec_idx is None:
+            continue
+
+        sec        = sections[sec_idx]
+        score_note = score_notes[xml_id]
+        note_beat  = float(score_note["onset_beat"])
+
+        # Lazy-init the time→beat function on the first note of each section
+        if not sec["first_valid_note"]:
+            sec["first_valid_note"] = True
+            beat_times = annotations[key]["performance_beats"]
+            sec["get_beats"] = build_time_to_beat_fn(
+                beat_times, onset_sec, note_beat
+            )
+
+        get_beats = sec["get_beats"]
+
+        # Performance-side features
+        duration_sec  = n["duration_sec"]
+        offset_sec    = onset_sec + duration_sec
+        pitch         = n["pitch"]
+        velocity      = n["velocity"] / 127.0
+
+        vel_delta = (0 if sec["prev_velocity"] is None
+                     else velocity - sec["prev_velocity"])
+        pitch_enc = encode_pitch(pitch)
+
+        onset_beat    = get_beats(onset_sec)
+        offset_beat   = get_beats(offset_sec)
         duration_beat = offset_beat - onset_beat
 
-        if prev_onset_beat is None:
-            ioi = 0
-        else:
-            ioi = onset_beat - prev_onset_beat
+        ioi = (0 if sec["prev_onset_beat"] is None
+               else onset_beat - sec["prev_onset_beat"])
 
-        velocity = n["velocity"] / 127.0
-        vel_delta = 0 if prev_velocity is None else velocity - prev_velocity
-        pitch_enc = encode_pitch(n["pitch"])
+        # Score-side ground truth (null tokens for out-of-vocab values)
+        beat_index, subdiv = beat_to_bar_position(note_beat)
+        duration_class     = quantize_duration(score_note["duration_beat"])
 
-        # -------- INPUTS --------
-        inp = {
-            "onset_ioi_beats": float(ioi),
-            "duration_beats": float(duration_beat),
-            "velocity": float(velocity),
+        sec["inputs"].append({
+            "onset_ioi_beats":          float(ioi),
+            "duration_beats":           float(duration_beat),
+            "velocity":                 float(velocity),
             "velocity_delta_from_prev": float(vel_delta),
-            **pitch_enc
-        }
-
-        # -------- TARGETS --------
-        beat_index, subdiv = beat_to_bar_position(score_note["onset_beat"])
-
-        duration_class = quantize_duration(score_note["duration_beat"])
-    
-        tgt = {
+            **pitch_enc,
+        })
+        sec["targets"].append({
             "beat_index_in_bar": beat_index,
-            "subdivision_index": subdiv,
-            "duration_class": duration_class,
-        }
+            "subdivision_index": subdiv,       # 0-11, or NULL_SUBDIV (12)
+            "duration_class":    duration_class,  # label string, possibly NULL_DURATION
+        })
 
-        inputs.append(inp)
-        targets.append(tgt)
+        sec["prev_velocity"]   = velocity
+        sec["prev_onset_beat"] = onset_beat
 
-        prev_velocity = velocity
-        prev_onset_beat = onset_beat
-
-    return inputs, targets
+    return [(sec["inputs"], sec["targets"])
+            for sec in sections.values()
+            if sec["inputs"]]
 
 
 # -----------------------------
 # Main dataset builder
 # -----------------------------
 def build_dataset(dataset_root):
-    # parse annotations
     dataset_root = Path(dataset_root)
-    annotations = load_annotations(dataset_root / "asap_annotations.json")
+    annotations  = load_annotations(dataset_root / "asap_annotations.json")
 
-    inputs_by_piece = {}
+    inputs_by_piece  = {}
     targets_by_piece = {}
 
-    # locate piece directories in possibly non-uniform file structure
     piece_dirs = find_piece_dirs(dataset_root)
 
-    counter = 0
-    errors = 0
+    counter            = 0
+    errors             = 0
+    counter_44         = 0
+    sections_extracted = 0
 
     for piece in piece_dirs:
 
@@ -226,59 +359,79 @@ def build_dataset(dataset_root):
         counter += 1
 
         try:
-
-            # parse ground-truth xml
             xml = piece / "xml_score.musicxml"
             if not xml.exists():
                 continue
 
-            # parse performance midis (may be multiple from different performers)
-            midis = [m for m in piece.glob("*.mid") if "midi_score" not in m.name]
-            for perf in midis:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                score = partitura.load_musicxml(xml)
 
-                # find alignment file
-                align_dir = piece / f"{perf.stem}_note_alignments"
+            midis = [m for m in piece.glob("*.mid") if "midi_score" not in m.name]
+            if not midis:
+                continue
+
+            # Use the first midi to look up the annotations key for time sigs
+            ann_key   = str(midis[0]).split("asap-dataset-main")[-1].lstrip("/")
+            time_sigs = annotations[ann_key].get("perf_time_signatures", {})
+            if not time_sigs:
+                print(f"    WARNING: No time signature info for {ann_key}, skipping")
+                errors += 1
+                continue
+
+            # Find all 4/4 time ranges (in seconds)
+            time_ranges_44 = get_44_time_ranges(time_sigs)
+            if not time_ranges_44:
+                print(f"    WARNING: No 4/4 sections found for {ann_key}, skipping")
+                errors += 1
+                continue
+
+            counter_44 += 1
+
+            has_non_44 = any(ts != "4/4" for _, (ts, _) in time_sigs.items())
+            if has_non_44:
+                print(f"    INFO: Mixed metre — extracting {len(time_ranges_44)} "
+                      f"4/4 section(s) starting at "
+                      f"{[f'{r[0]:.2f}s' for r in time_ranges_44]}")
+
+            # Parse each performance midi
+            for perf in midis:
+                align_dir  = piece / f"{perf.stem}_note_alignments"
                 align_file = align_dir / "note_alignment.tsv"
                 if not align_file.exists():
+                    print(f"    WARNING: No alignment file for {perf.name}, skipping")
+                    errors += 1
                     continue
 
                 print(f"  Parsing performance: {perf.name}")
 
-                inputs, targets = parse_performance(
+                section_results = parse_performance(
                     dataset_root,
                     perf,
-                    xml,
+                    score,
                     align_file,
-                    annotations
+                    annotations,
+                    time_ranges_44=time_ranges_44,
                 )
 
-                print (f"    Extracted {len(inputs)} notes")
-
-                if inputs:
-                    key = f"{piece}_{perf.stem}"
-                    inputs_by_piece[key] = inputs
-                    targets_by_piece[key] = targets
+                for sec_idx, (inputs, targets) in enumerate(section_results):
+                    if not inputs:
+                        continue
+                    print(f"    Section {sec_idx}: {len(inputs)} notes")
+                    sec_key = f"{piece}_{perf.stem}_sec{sec_idx}"
+                    inputs_by_piece[sec_key]  = inputs
+                    targets_by_piece[sec_key] = targets
+                    sections_extracted += 1
 
         except Exception as e:
             print(f"  ERROR parsing {piece.name}: {e}")
             errors += 1
             continue
 
-    print(f"Finished parsing dataset. Successfully parsed {counter - errors} pieces, {errors} errors.")
+    print(f"\nFinished parsing dataset.")
+    print(f"  Pieces visited:             {counter}")
+    print(f"  Pieces with ≥1 4/4 section: {counter_44}")
+    print(f"  Errors / skipped:           {errors}")
+    print(f"  Total sections extracted:   {sections_extracted}")
 
     return inputs_by_piece, targets_by_piece
-
-# def write_dataset_to_csv(inputs_by_piece, targets_by_piece, output_path):
-#     with open(output_path, "w", newline="") as f:
-#         writer = csv.writer(f)
-
-#         # Write header
-#         writer.writerow(["piece_perf_id", "input", "target"])
-
-#         for key in inputs_by_piece:
-
-#             inputs = inputs_by_piece[key]
-#             targets = targets_by_piece[key]
-
-#             for inp, tgt in zip(inputs, targets):
-#                 writer.writerow([key, inp, tgt])

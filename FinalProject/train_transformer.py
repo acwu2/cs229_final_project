@@ -24,8 +24,13 @@ from tqdm import tqdm
 from model import TransformerRhythmQuantizer, NUM_BEATS, NUM_SUBDIVS, NUM_DUR_CLASSES
 from parse_asap_data import IDX_TO_DURATION
 
-INPUT_DIM = 8   # 7 original + cumulative IOI
+from collections import defaultdict
 
+from torch.utils.tensorboard import SummaryWriter
+
+from sklearn.model_selection import KFold
+
+INPUT_DIM = 8   # 7 original + cumulative IOI
 
 # ===================================================================
 # Dataset — adds cumulative IOI as 8th feature on the fly
@@ -47,9 +52,9 @@ class MultiHeadRhythmDataset(Dataset):
         cum_ioi = (torch.cumsum(x[:, 0], dim=0) % 4).unsqueeze(1)  # (T, 1)
         x = torch.cat([x, cum_ioi], dim=1)                   # (T, 8)
 
-        y_beat = y3[:, 0].long().clamp(0, NUM_BEATS - 1)
-        y_sub  = y3[:, 1].long().clamp(0, NUM_SUBDIVS - 1)
-        y_dur  = y3[:, 2].long().clamp(0, NUM_DUR_CLASSES - 1)
+        y_beat = y3[:, 0].long().clamp(0, NUM_BEATS - 1)  # beat is always valid, clamp is fine
+        y_sub  = y3[:, 1].long()                           # may contain -100, don't clamp
+        y_dur  = y3[:, 2].long()                           # may contain -100, don't clamp
 
         if self.max_seq_len is not None:
             x      = x[: self.max_seq_len]
@@ -58,7 +63,47 @@ class MultiHeadRhythmDataset(Dataset):
             y_dur  = y_dur[: self.max_seq_len]
 
         return x, y_beat, y_sub, y_dur
+    
+# version with windowing
+# class MultiHeadRhythmDataset(Dataset):
+#     def __init__(self, sequences: list[dict], window_size: int | None = None, stride: int | None = None):
+#         self.window_size = window_size
+#         self.stride = stride if stride is not None else window_size
 
+#         # Pre-compute (sequence_idx, start_pos) pairs for all windows
+#         self.windows = []
+#         for seq_idx, seq in enumerate(sequences):
+#             T = seq["inputs"].shape[0]
+#             if window_size is None:
+#                 self.windows.append((seq_idx, 0, T))
+#             else:
+#                 start = 0
+#                 while start < T:
+#                     end = min(start + window_size, T)
+#                     self.windows.append((seq_idx, start, end))
+#                     if end == T:
+#                         break
+#                     start += self.stride
+
+#         self.sequences = sequences
+
+#     def __len__(self):
+#         return len(self.windows)
+
+#     def __getitem__(self, idx):
+#         seq_idx, start, end = self.windows[idx]
+#         seq = self.sequences[seq_idx]
+#         x = seq["inputs"][start:end]        # (T', 7)
+#         y3 = seq["targets"][start:end]      # (T', 3)
+
+#         cum_ioi = (torch.cumsum(x[:, 0], dim=0) % 4).unsqueeze(1)
+#         x = torch.cat([x, cum_ioi], dim=1)  # (T', 8)
+
+#         y_beat = y3[:, 0].long().clamp(0, NUM_BEATS - 1)
+#         y_sub  = y3[:, 1].long().clamp(0, NUM_SUBDIVS - 1)
+#         y_dur  = y3[:, 2].long().clamp(0, NUM_DUR_CLASSES - 1)
+
+#         return x, y_beat, y_sub, y_dur
 
 def collate_fn(batch):
     xs, y_beats, y_subs, y_durs = zip(*batch)
@@ -132,8 +177,9 @@ def run_epoch(model, loader, criterion, device, optimizer=None, loss_weights=Non
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
-            total_loss += loss.item() * x_pad.shape[0]
-            n_samples  += x_pad.shape[0]
+            n_tokens = (beat_tgt != -100).sum().item()
+            total_loss += loss.item() * n_tokens
+            n_samples += n_tokens
 
             all_bp.append(logits["beat"].detach().argmax(-1).cpu())
             all_sp.append(logits["subdiv"].detach().argmax(-1).cpu())
@@ -174,7 +220,11 @@ def main():
     parser.add_argument("--w-beat",         type=float, default=1.0)
     parser.add_argument("--w-subdiv",       type=float, default=1.0)
     parser.add_argument("--w-dur",          type=float, default=1.0)
+    parser.add_argument("--tensorboard_name",           type=str,   default="")
+    parser.add_argument("--k-folds",        type=int,   default=5)
     args = parser.parse_args()
+
+    writer = SummaryWriter(f"runs/music_transformer_{args.tensorboard_name}")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -191,74 +241,143 @@ def main():
     sequences = raw["sequences"]
     print(f"Loaded {len(sequences)} sequences  |  input_dim={INPUT_DIM} (7 + cumulative IOI)")
 
-    indices  = np.random.permutation(len(sequences))
-    n_val    = max(1, int(len(sequences) * args.val_split))
-    val_seqs   = [sequences[i] for i in indices[:n_val]]
-    train_seqs = [sequences[i] for i in indices[n_val:]]
+    # group perfromances by piece to ensure no leakage between train and val sets
+    piece_groups = defaultdict(list)
+    for seq in sequences:
+        key = seq["id"]
+        # piece id = directory containing the performances
+        piece_id = "/".join(key.split("_")[:-1])
+        piece_groups[piece_id].append(seq)
 
-    max_seq_len = args.max_seq_len if args.max_seq_len > 0 else None
-    loader_kwargs = dict(batch_size=args.batch_size, collate_fn=collate_fn,
-                         num_workers=args.num_workers, pin_memory=(device.type == "cuda"))
-    train_loader = DataLoader(MultiHeadRhythmDataset(train_seqs, max_seq_len), shuffle=True,  **loader_kwargs)
-    val_loader   = DataLoader(MultiHeadRhythmDataset(val_seqs,   max_seq_len), shuffle=False, **loader_kwargs)
+    piece_ids = np.array(list(piece_groups.keys()))
 
-    model = TransformerRhythmQuantizer(
-        input_dim=INPUT_DIM,
-        hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers,
-        nhead=args.nhead,
-        dropout=args.dropout,
-        dim_feedforward=args.dim_feedforward,
-    ).to(device)
-    print(f"Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    kf = KFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed)
 
-    optimizer    = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler    = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    criterion    = nn.CrossEntropyLoss(ignore_index=-100)
-    loss_weights = {"beat": args.w_beat, "subdiv": args.w_subdiv, "dur": args.w_dur}
-    print(f"Loss weights: {loss_weights}")
+    fold_results = []
 
-    out = Path(args.output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    ts        = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    ckpt_path = out / f"rhythm_transformer_cumioi_{ts}.pt"
+    print(f"training with {args.k_folds} folds on piece_ids: {piece_ids}")
 
-    best_val_acc, patience_ctr = -1.0, 0
+    for fold, (train_idx, val_idx) in enumerate(kf.split(piece_ids), 1):
 
-    for epoch in range(1, args.epochs + 1):
-        t0      = time.time()
-        train_m = run_epoch(model, train_loader, criterion, device, optimizer, loss_weights)
-        val_m   = run_epoch(model, val_loader,   criterion, device, loss_weights=loss_weights)
-        scheduler.step()
+        print(f"\n========== Fold {fold}/{args.k_folds} ==========")
 
-        print(
-            f"Epoch {epoch:3d}/{args.epochs}  "
-            f"train_loss={train_m['loss']:.4f}  train_acc={train_m['acc']:.3f}  "
-            f"val_loss={val_m['loss']:.4f}  val_acc={val_m['acc']:.3f}  "
-            f"[beat={val_m['beat_acc']:.3f}  sub={val_m['subdiv_acc']:.3f}  "
-            f"dur={val_m['dur_acc']:.3f}]  ({time.time()-t0:.1f}s)"
-        )
+        train_piece_ids = set(piece_ids[train_idx])
+        val_piece_ids   = set(piece_ids[val_idx])
 
-        if val_m["acc"] > best_val_acc:
-            best_val_acc  = val_m["acc"]
-            patience_ctr  = 0
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "args": vars(args),
-                "epoch": epoch,
-                "val_metrics": val_m,
-                "duration_vocab": raw["duration_vocab"],
-                "model_type": "transformer_cumioi",
-                "input_dim": INPUT_DIM,
-            }, ckpt_path)
-            print(f"  -> Saved checkpoint (val_acc={best_val_acc:.4f})")
-        else:
-            patience_ctr += 1
-            if patience_ctr >= args.patience:
-                print(f"  Early stopping at epoch {epoch}")
-                break
+        train_seqs = []
+        val_seqs = []
 
-    print(f"\nDone. Best val_acc={best_val_acc:.4f}  |  Checkpoint: {ckpt_path}")
+        for pid, seqs in piece_groups.items():
+            if pid in val_piece_ids:
+                val_seqs.extend(seqs)
+            else:
+                train_seqs.extend(seqs)
+
+        print(f"Train sequences: {len(train_seqs)} | Val sequences: {len(val_seqs)}")
+
+        max_seq_len = args.max_seq_len if args.max_seq_len > 0 else None
+        loader_kwargs = dict(batch_size=args.batch_size, collate_fn=collate_fn,
+                            num_workers=args.num_workers, pin_memory=(device.type == "cuda"))
+        train_loader = DataLoader(MultiHeadRhythmDataset(train_seqs, max_seq_len), shuffle=True,  **loader_kwargs)
+        val_loader   = DataLoader(MultiHeadRhythmDataset(val_seqs,   max_seq_len), shuffle=False, **loader_kwargs)
+
+        window_size = 256
+        stride = 128
+
+        # train_loader = DataLoader(
+        #     MultiHeadRhythmDataset(train_seqs, window_size, stride),
+        #     shuffle=True,
+        #     **loader_kwargs
+        # )
+
+        # val_loader = DataLoader(
+        #     MultiHeadRhythmDataset(val_seqs, window_size, window_size),  # no overlap
+        #     shuffle=False,
+        #     **loader_kwargs
+        # )
+
+        model = TransformerRhythmQuantizer(
+            input_dim=INPUT_DIM,
+            hidden_dim=args.hidden_dim,
+            num_layers=args.num_layers,
+            nhead=args.nhead,
+            dropout=args.dropout,
+            dim_feedforward=args.dim_feedforward,
+        ).to(device)
+        print(f"Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+        optimizer    = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler    = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+        criterion    = nn.CrossEntropyLoss(ignore_index=-100)
+        loss_weights = {"beat": args.w_beat, "subdiv": args.w_subdiv, "dur": args.w_dur}
+        print(f"Loss weights: {loss_weights}")
+
+        out = Path(args.output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        ts        = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ckpt_path = out / f"rhythm_transformer_cumioi_{ts}.pt"
+
+        best_val_acc, patience_ctr = -1.0, 0
+
+        for epoch in range(1, args.epochs + 1):
+            t0      = time.time()
+            train_m = run_epoch(model, train_loader, criterion, device, optimizer, loss_weights)
+            val_m   = run_epoch(model, val_loader,   criterion, device, loss_weights=loss_weights)
+            scheduler.step()
+
+            # ---- LOG METRICS ----
+            writer.add_scalar("loss/train", train_m["loss"], epoch)
+            writer.add_scalar("loss/val", val_m["loss"], epoch)
+
+            writer.add_scalar("accuracy/train", train_m["acc"], epoch)
+            writer.add_scalar("accuracy/val", val_m["acc"], epoch)
+
+            writer.add_scalar("accuracy/beat_train", train_m["beat_acc"], epoch)
+            writer.add_scalar("accuracy/subdiv_train", train_m["subdiv_acc"], epoch)
+            writer.add_scalar("accuracy/dur_train", train_m["dur_acc"], epoch)
+
+            writer.add_scalar("accuracy/beat_val", val_m["beat_acc"], epoch)
+            writer.add_scalar("accuracy/subdiv_val", val_m["subdiv_acc"], epoch)
+            writer.add_scalar("accuracy/dur_val", val_m["dur_acc"], epoch)
+
+            print(
+                f"Epoch {epoch:3d}/{args.epochs}  "
+                f"train_loss={train_m['loss']:.4f}  train_acc={train_m['acc']:.3f}  "
+                f"[beat={train_m['beat_acc']:.3f}  sub={train_m['subdiv_acc']:.3f}  "
+                f"dur={train_m['dur_acc']:.3f}]"
+                f"val_loss={val_m['loss']:.4f}  val_acc={val_m['acc']:.3f}  "
+                f"[beat={val_m['beat_acc']:.3f}  sub={val_m['subdiv_acc']:.3f}  "
+                f"dur={val_m['dur_acc']:.3f}]  ({time.time()-t0:.1f}s)"
+            )
+
+            if val_m["acc"] > best_val_acc:
+                best_val_acc  = val_m["acc"]
+                patience_ctr  = 0
+                torch.save({
+                    "model_state_dict": model.state_dict(),
+                    "args": vars(args),
+                    "epoch": epoch,
+                    "val_metrics": val_m,
+                    "duration_vocab": raw["duration_vocab"],
+                    "model_type": "transformer_cumioi",
+                    "input_dim": INPUT_DIM,
+                }, ckpt_path)
+                print(f"  -> Saved checkpoint (val_acc={best_val_acc:.4f})")
+            else:
+                patience_ctr += 1
+                if patience_ctr >= args.patience:
+                    print(f"  Early stopping at epoch {epoch}")
+                    break
+
+        fold_results.append(best_val_acc)
+        print(f"Fold {fold} best_val_acc = {best_val_acc:.4f}  |  Checkpoint: {ckpt_path}")
+    
+    print("\n========== Cross-Validation Results ==========")
+    for i, acc in enumerate(fold_results, 1):
+        print(f"Fold {i}: {acc:.4f}")
+
+    print(f"\nMean val_acc: {np.mean(fold_results):.4f}")
+    print(f"Std  val_acc: {np.std(fold_results):.4f}")
 
 
 if __name__ == "__main__":

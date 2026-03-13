@@ -1,5 +1,5 @@
 import torch
-from parse_asap_data import build_dataset, DURATION_VOCAB
+from parse_asap_data import build_dataset, DURATION_VOCAB, NULL_DURATION_IDX, NULL_SUBDIV
 
 def convert_sequence_to_tensors(inputs, targets):
     """
@@ -27,10 +27,14 @@ def convert_sequence_to_tensors(inputs, targets):
         x_list.append(x_vec)
 
         # ----- Targets -----
+        # Remap null tokens to -100 so CrossEntropyLoss(ignore_index=-100) masks them
+        dur_idx = DURATION_VOCAB[tgt["duration_class"]]
+        subdiv  = tgt["subdivision_index"]
+
         y_vec = [
-            tgt["beat_index_in_bar"],                     # 0–3
-            tgt["subdivision_index"],                     # 0–3
-            DURATION_VOCAB[tgt["duration_class"]]         # categorical index
+            tgt["beat_index_in_bar"],                          # 0–3, never null
+            -100 if subdiv  == NULL_SUBDIV      else subdiv,   # 0–11, or masked
+            -100 if dur_idx == NULL_DURATION_IDX else dur_idx, # 0–10, or masked
         ]
         y_list.append(y_vec)
 
