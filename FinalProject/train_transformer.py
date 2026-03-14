@@ -52,7 +52,7 @@ class MultiHeadRhythmDataset(Dataset):
         cum_ioi = (torch.cumsum(x[:, 0], dim=0) % 4).unsqueeze(1)  # (T, 1)
         x = torch.cat([x, cum_ioi], dim=1)                   # (T, 8)
 
-        y_beat = y3[:, 0].long().clamp(0, NUM_BEATS - 1)  # beat is always valid, clamp is fine
+        y_beat = y3[:, 0].long()                         # may contain -100, don't clamp
         y_sub  = y3[:, 1].long()                           # may contain -100, don't clamp
         y_dur  = y3[:, 2].long()                           # may contain -100, don't clamp
 

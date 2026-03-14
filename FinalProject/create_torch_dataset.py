@@ -27,12 +27,15 @@ def convert_sequence_to_tensors(inputs, targets):
         x_list.append(x_vec)
 
         # ----- Targets -----
-        # Remap null tokens to -100 so CrossEntropyLoss(ignore_index=-100) masks them
-        dur_idx = DURATION_VOCAB[tgt["duration_class"]]
-        subdiv  = tgt["subdivision_index"]
+        # Remap null tokens to -100 so CrossEntropyLoss(ignore_index=-100) masks them.
+        # The sequence start token uses -100 for beat_index_in_bar as well, since
+        # it carries no note-level prediction target.
+        dur_idx    = DURATION_VOCAB[tgt["duration_class"]]
+        subdiv     = tgt["subdivision_index"]
+        beat_index = tgt["beat_index_in_bar"]
 
         y_vec = [
-            tgt["beat_index_in_bar"],                          # 0–3, never null
+            -100 if beat_index == -100 else beat_index,        # 0–3, or masked (start token)
             -100 if subdiv  == NULL_SUBDIV      else subdiv,   # 0–11, or masked
             -100 if dur_idx == NULL_DURATION_IDX else dur_idx, # 0–10, or masked
         ]
@@ -83,3 +86,15 @@ if __name__ == "__main__":
     }, "dataset.pt")
 
     print("Saved dataset to dataset.pt")
+
+    quantized_X, quantized_Y = build_dataset(root, isQuantized=True)
+    print("Pieces parsed:", len(quantized_X))
+
+    quantized_dataset = build_torch_dataset(quantized_X, quantized_Y)
+
+    torch.save({
+        "sequences": quantized_dataset,
+        "duration_vocab": DURATION_VOCAB
+    }, "quantized_dataset.pt")
+
+    print("Saved dataset to quantized_dataset.pt")

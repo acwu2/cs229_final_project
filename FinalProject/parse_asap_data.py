@@ -179,12 +179,75 @@ def get_44_time_ranges(time_sigs):
 
 
 # -----------------------------
+# Sequence start token
+#
+# Prepended to every sequence so the model (and the rules baseline) know the
+# absolute bar position of the first note without having to guess from IOIs.
+#
+# Feature layout (7 stored values; the 8th — is_start_token — is injected
+# by the Dataset class in place of the cumulative-IOI feature it normally
+# appends, since cum_ioi is always 0.0 for this token and the model can use
+# the non-zero value as a sentinel):
+#   0  onset_ioi_beats          → 0.0  (meaningless for this token)
+#   1  duration_beats           → 0.0
+#   2  velocity                 → 0.0
+#   3  velocity_delta_from_prev → 0.0
+#   4  pc_sin                   → sin encoding of start beat index (0-3)
+#   5  pc_cos                   → cos encoding of start beat index (0-3)
+#   6  octave_norm              → start subdivision / 11.0  (0.0-1.0)
+# The 8th column (cum_ioi % 4) will naturally be 0.0 for this token too,
+# since its onset_ioi_beats is 0.0.  The model distinguishes it because
+# all note-level features are zero and pc_sin/pc_cos encode the bar anchor.
+#
+# The corresponding target row is all -100 (masked on every head).
+# -----------------------------
+
+def build_start_token(first_note_beat):
+    """
+    Build the sequence-start input dict and its all-masked target dict.
+
+    Parameters
+    ----------
+    first_note_beat : float
+        Score-side onset_beat of the first note in the section.
+
+    Returns
+    -------
+    start_input  : dict  — 7 named features matching normal note dicts
+    start_target : dict  — all values masked (-100 / NULL_DURATION)
+    """
+    beat_index, subdiv = beat_to_bar_position(first_note_beat)
+
+    # Encode beat index (0-3) on a unit circle, same style as pitch class
+    start_input = {
+        "onset_ioi_beats":          0.0,
+        "duration_beats":           0.0,
+        "velocity":                 0.0,
+        "velocity_delta_from_prev": 0.0,
+        "pc_sin":    np.sin(2 * np.pi * beat_index / 4),
+        "pc_cos":    np.cos(2 * np.pi * beat_index / 4),
+        # Subdivision normalised to [0, 1]; NULL_SUBDIV (12) maps to ~1.09,
+        # distinguishable from valid range, but first notes are always on-grid.
+        "octave_norm": subdiv / 11.0,
+    }
+
+    # All three prediction heads must ignore this token
+    start_target = {
+        "beat_index_in_bar": -100,
+        "subdivision_index": -100,        # already the sentinel value
+        "duration_class":    NULL_DURATION,  # converted to -100 in Dataset
+    }
+
+    return start_input, start_target
+
+
+# -----------------------------
 # Core parser for one performance.
 # Accepts a list of (start_sec, end_sec) time ranges to restrict extraction.
 # Returns one (inputs, targets) pair per contiguous 4/4 section.
 # -----------------------------
 def parse_performance(piece_root, perf_mid, score, alignment_file, annotations,
-                      time_ranges_44=None):
+                      time_ranges_44=None, isQuantized=False):
     """
     Parameters
     ----------
@@ -284,12 +347,16 @@ def parse_performance(piece_root, perf_mid, score, alignment_file, annotations,
         note_beat  = float(score_note["onset_beat"])
 
         # Lazy-init the time→beat function on the first note of each section
+        # and prepend the sequence start token anchored to that note's score beat
         if not sec["first_valid_note"]:
             sec["first_valid_note"] = True
             beat_times = annotations[key]["performance_beats"]
             sec["get_beats"] = build_time_to_beat_fn(
                 beat_times, onset_sec, note_beat
             )
+            start_inp, start_tgt = build_start_token(note_beat)
+            sec["inputs"].append(start_inp)
+            sec["targets"].append(start_tgt)
 
         get_beats = sec["get_beats"]
 
@@ -303,9 +370,13 @@ def parse_performance(piece_root, perf_mid, score, alignment_file, annotations,
                      else velocity - sec["prev_velocity"])
         pitch_enc = encode_pitch(pitch)
 
-        onset_beat    = get_beats(onset_sec)
-        offset_beat   = get_beats(offset_sec)
-        duration_beat = offset_beat - onset_beat
+        if not isQuantized:
+            onset_beat    = get_beats(onset_sec)
+            offset_beat   = get_beats(offset_sec)
+            duration_beat = offset_beat - onset_beat
+        else:
+            onset_beat    = note_beat
+            duration_beat = float(score_note["duration_beat"])
 
         ioi = (0 if sec["prev_onset_beat"] is None
                else onset_beat - sec["prev_onset_beat"])
@@ -338,7 +409,7 @@ def parse_performance(piece_root, perf_mid, score, alignment_file, annotations,
 # -----------------------------
 # Main dataset builder
 # -----------------------------
-def build_dataset(dataset_root):
+def build_dataset(dataset_root, isQuantized=False):
     dataset_root = Path(dataset_root)
     annotations  = load_annotations(dataset_root / "asap_annotations.json")
 
@@ -412,6 +483,7 @@ def build_dataset(dataset_root):
                     align_file,
                     annotations,
                     time_ranges_44=time_ranges_44,
+                    isQuantized=isQuantized,
                 )
 
                 for sec_idx, (inputs, targets) in enumerate(section_results):
